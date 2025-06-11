@@ -4,7 +4,12 @@ use winapi::{
     ctypes::c_void,
     shared::{basetsd::SIZE_T, minwindef::DWORD},
     um::{
-        errhandlingapi::{GetLastError, SetLastError}, memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory}, minwinbase::LPTHREAD_START_ROUTINE, processthreadsapi::{CreateRemoteThread, OpenProcess}, psapi::{EnumProcesses, GetModuleBaseNameA}, winnt::{LPSTR, MEM_COMMIT, MEM_TOP_DOWN, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ}
+        errhandlingapi::{GetLastError, SetLastError},
+        memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory},
+        minwinbase::LPTHREAD_START_ROUTINE,
+        processthreadsapi::{CreateRemoteThread, OpenProcess},
+        psapi::{EnumProcesses, GetModuleBaseNameA},
+        winnt::{LPSTR, MEM_COMMIT, MEM_TOP_DOWN, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
     },
 };
 
@@ -125,7 +130,7 @@ pub unsafe fn remote_allocate(
     process: &SafeHandle,
     size: SIZE_T,
     protect: DWORD,
-) -> Option<*mut c_void> {
+) -> Option<*mut u8> {
     if process.is_bad() {
         return None;
     }
@@ -138,7 +143,7 @@ pub unsafe fn remote_allocate(
             MEM_COMMIT | MEM_TOP_DOWN,
             protect,
         )
-    };
+    } as *mut u8;
     if ptr.is_null() {
         return None;
     }
@@ -151,7 +156,7 @@ pub unsafe fn remote_allocate(
     Some(ptr)
 }
 
-pub unsafe fn remote_write(process: &SafeHandle, address: *mut c_void, buffer: &[u8]) -> bool {
+pub unsafe fn remote_write<T>(process: &SafeHandle, address: *mut T, buffer: &[u8]) -> bool {
     if process.is_bad() {
         return false;
     }
@@ -160,7 +165,7 @@ pub unsafe fn remote_write(process: &SafeHandle, address: *mut c_void, buffer: &
     let ret = unsafe {
         WriteProcessMemory(
             process.get(),
-            address,
+            address as _,
             buffer.as_ptr() as _,
             buffer.len(),
             &mut written_bytes,
@@ -180,9 +185,9 @@ pub unsafe fn remote_write(process: &SafeHandle, address: *mut c_void, buffer: &
     true
 }
 
-pub unsafe fn remote_protect(
+pub unsafe fn remote_protect<T>(
     process: &SafeHandle,
-    address: *mut c_void,
+    address: *mut T,
     size: SIZE_T,
     protect_flags: DWORD,
 ) -> bool {
@@ -194,7 +199,7 @@ pub unsafe fn remote_protect(
     let ret = unsafe {
         VirtualProtectEx(
             process.get(),
-            address,
+            address as _,
             size,
             protect_flags,
             &mut old_protect,
@@ -210,14 +215,26 @@ pub unsafe fn remote_protect(
     true
 }
 
-pub unsafe fn remote_thread(process: &SafeHandle, start_address: LPTHREAD_START_ROUTINE, parameter: *mut c_void) -> Option<SafeHandle> {
+pub unsafe fn remote_thread<T>(
+    process: &SafeHandle,
+    start_address: LPTHREAD_START_ROUTINE,
+    parameter: *mut T,
+) -> Option<SafeHandle> {
     if process.is_bad() {
-        return None; 
+        return None;
     }
 
-    let ret = SafeHandle::from(
-        unsafe { CreateRemoteThread(process.get(), std::ptr::null_mut(), 0, start_address, parameter, 0, std::ptr::null_mut()) }
-    );
+    let ret = SafeHandle::from(unsafe {
+        CreateRemoteThread(
+            process.get(),
+            std::ptr::null_mut(),
+            0,
+            start_address,
+            parameter as _,
+            0,
+            std::ptr::null_mut(),
+        )
+    });
 
     let error = unsafe { GetLastError() };
     if ret.is_bad() || error != 0 {
