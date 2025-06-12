@@ -1,13 +1,12 @@
 use super::handle::SafeHandle;
 use std::vec::Vec;
 use winapi::{
-    ctypes::c_void,
     shared::{basetsd::SIZE_T, minwindef::DWORD},
     um::{
         errhandlingapi::{GetLastError, SetLastError},
         memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory},
         minwinbase::LPTHREAD_START_ROUTINE,
-        processthreadsapi::{CreateRemoteThread, OpenProcess},
+        processthreadsapi::{CreateRemoteThread, GetCurrentProcessId, OpenProcess},
         psapi::{EnumProcesses, GetModuleBaseNameA},
         winnt::{LPSTR, MEM_COMMIT, MEM_TOP_DOWN, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
     },
@@ -54,6 +53,33 @@ fn get_all_processes() -> Vec<u32> {
     pids
 }
 
+fn get_process_name_by_handle(handle: &SafeHandle) -> Option<String> {
+    if handle.is_bad() {
+        return None;
+    }
+
+    let mut name_bytes = [0u8; 260];
+    let ret = unsafe {
+        GetModuleBaseNameA(
+            handle.get(),
+            std::ptr::null_mut(),
+            name_bytes.as_mut_ptr() as LPSTR,
+            name_bytes.len() as u32,
+        ) as usize
+    };
+
+    let error = unsafe { GetLastError() };
+    if ret == 0 || error != 0 {
+        unsafe { SetLastError(0) };
+        return None;
+    }
+
+    let test = std::str::from_utf8(&name_bytes[..ret])
+        .map(|x| x.to_string())
+        .ok();
+    test
+}
+
 fn find_process_pid_by_name(name: &str) -> Option<u32> {
     let pids = get_all_processes();
     if pids.is_empty() {
@@ -61,45 +87,31 @@ fn find_process_pid_by_name(name: &str) -> Option<u32> {
     }
 
     let mut names = pids
-        .into_iter()
+        .iter()
         .map(|pid| {
             let handle = request_handle(
+                ProcessIds::Pid(*pid),
                 PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                ProcessIds::Pid(pid),
             );
             (pid, handle)
         })
         .filter(|(_, x)| x.is_some() && !x.as_ref().unwrap().is_bad())
-        .map(|(pid, x)| {
-            let mut name = [0u8; 260];
-            let ret = unsafe {
-                GetModuleBaseNameA(
-                    x.unwrap().get(),
-                    std::ptr::null_mut(),
-                    name.as_mut_ptr() as LPSTR,
-                    name.len() as u32,
-                ) as usize
-            };
-            let error = unsafe { GetLastError() };
-            name[ret] = 0;
-            (pid, name, ret, error)
-        })
-        .filter(|(_, _, ret, error)| *error == 0 || *ret != 0);
+        .map(|(pid, x)| (pid, get_process_name_by_handle(&x.unwrap())))
+        .filter(|(_, name)| !name.is_none())
+        .map(|(pid, name)| (pid, name.unwrap()));
 
-    let pid = names
-        .find(|(_, entry, len, _)| {
-            str::from_utf8(&entry[..*len]).unwrap().to_lowercase() == name.to_lowercase()
-        })
+    names
+        .find(|(_, entry)| entry.to_lowercase() == name.to_lowercase())
         .into_iter()
-        .map(|(pid, _, _, _)| pid)
-        .next();
-    pid
+        .map(|(pid, _)| *pid)
+        .next()
 }
 
 #[derive(Debug)]
 pub enum ProcessIds<'a> {
     Name(&'a str),
     Pid(u32),
+    Yourself,
 }
 
 impl<'a> ProcessIds<'a> {
@@ -107,11 +119,40 @@ impl<'a> ProcessIds<'a> {
         match *self {
             ProcessIds::Pid(pid) => Some(pid),
             ProcessIds::Name(name) => find_process_pid_by_name(name),
+            ProcessIds::Yourself => Some(unsafe { GetCurrentProcessId() }),
         }
     }
 }
 
-pub fn request_handle(desired_access: DWORD, process: ProcessIds<'_>) -> Option<SafeHandle> {
+impl std::cmp::PartialOrd<ProcessIds<'_>> for ProcessIds<'_> {
+    fn partial_cmp(&self, other: &ProcessIds<'_>) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+
+        let Some(pid) = self.get_os_pid() else {
+            return None;
+        };
+        let Some(other_pid) = other.get_os_pid() else {
+            return None;
+        };
+
+        if pid == other_pid {
+            return Some(Ordering::Equal);
+        } else if pid > other_pid {
+            return Some(Ordering::Greater);
+        }
+
+        Some(Ordering::Less)
+    }
+}
+
+impl std::cmp::PartialEq<ProcessIds<'_>> for ProcessIds<'_> {
+    fn eq(&self, other: &ProcessIds<'_>) -> bool {
+        self.get_os_pid() == other.get_os_pid()
+    }
+}
+
+pub fn request_handle(process: ProcessIds<'_>, desired_access: DWORD) -> Option<SafeHandle> {
+    let _process = &process;
     let pid = process.get_os_pid()?;
     let process = SafeHandle::from(unsafe { OpenProcess(desired_access, 0, pid).into() });
     let error = unsafe { GetLastError() };
@@ -243,4 +284,56 @@ pub unsafe fn remote_thread<T>(
     }
 
     Some(ret)
+}
+
+#[cfg(test)]
+mod tests {
+    use winapi::um::winnt::{PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+
+    use crate::util::process::{self, ProcessIds, get_all_processes, get_process_name_by_handle};
+
+    #[test]
+    fn has_processes() {
+        let processes = get_all_processes();
+        assert!(processes.len() >= 2);
+    }
+
+    #[test]
+    fn has_runtime_broker_process() {
+        let runtime_broker = ProcessIds::Name("RuntimeBroker.exe");
+        assert_ne!(runtime_broker.get_os_pid(), None);
+    }
+
+    #[test]
+    fn name_pid_match() {
+        let runtime_broker = ProcessIds::Name("RuntimeBroker.exe");
+        let runtime_broker2 = ProcessIds::Pid(runtime_broker.get_os_pid().unwrap());
+
+        assert_eq!(runtime_broker, runtime_broker2);
+    }
+
+    #[test]
+    fn name_case_insensitive() {
+        let runtime_broker = ProcessIds::Name("RuntimeBroker.exe");
+        let runtime_broker2 = ProcessIds::Name("RuntimeBROKER.eXe");
+
+        assert_eq!(runtime_broker, runtime_broker2);
+    }
+
+    #[test]
+    fn open_process_get_name() {
+        let process = ProcessIds::Name("RuntimeBroker.exe");
+
+        let handle = process::request_handle(process, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ);
+        assert!(handle.is_some());
+
+        let handle = handle.unwrap();
+        assert!(!handle.is_bad());
+
+        let name = get_process_name_by_handle(&handle);
+        assert!(name.is_some());
+
+        let name = name.unwrap();
+        assert_eq!(name.to_lowercase(), "runtimebroker.exe");
+    }
 }

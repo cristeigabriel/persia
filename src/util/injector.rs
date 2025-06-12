@@ -1,11 +1,9 @@
-use pelite::{
-    pe::{
-        exports::GetProcAddress,
-        headers::{SectionHeader, SectionHeaders},
-    },
-    pe64::*,
+use pelite::{pe::exports::GetProcAddress, pe64::*};
+use std::{
+    fs,
+    io::{self},
+    result::Result,
 };
-use std::{fs, io::{self, Read}, ops::DerefMut, result::Result};
 use winapi::{
     ctypes::c_void,
     shared::{basetsd::SIZE_T, minwindef::DWORD},
@@ -15,12 +13,10 @@ use winapi::{
         winnt::{
             IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
             IMAGE_SUBSYSTEM_WINDOWS_GUI, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-            PAGE_EXECUTE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE, PROCESS_ALL_ACCESS,
+            PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PROCESS_ALL_ACCESS,
         },
     },
 };
-
-use crate::util::process::remote_write;
 
 use super::{process, process::ProcessIds};
 
@@ -56,7 +52,7 @@ fn get_rwe_from_characteristics(characteristics: u32) -> (bool, bool, bool) {
 fn get_page_protection_from_characteristics(characteristics: u32) -> DWORD {
     let (readable, writable, executable) = get_rwe_from_characteristics(characteristics);
 
-    let mut protection_flags: DWORD = 0;
+    let mut protection_flags = PAGE_NOACCESS;
     if executable && readable && writable {
         protection_flags = PAGE_EXECUTE_READWRITE;
     } else if executable && readable && !writable {
@@ -99,7 +95,7 @@ pub unsafe fn inject(process: ProcessIds, path: &str) -> Result<(), io::Error> {
     let dll_bytes = dll_bytes.as_mut_slice();
 
     // Next, lets make sure we can access the process...
-    let Some(process) = process::request_handle(PROCESS_ALL_ACCESS, process) else {
+    let Some(process) = process::request_handle(process, PROCESS_ALL_ACCESS) else {
         let error = unsafe { GetLastError() as i32 };
         return Err(io::Error::from_raw_os_error(error));
     };
@@ -116,7 +112,12 @@ pub unsafe fn inject(process: ProcessIds, path: &str) -> Result<(), io::Error> {
     unsafe {
         // Calculate allocation size for the in-memory representation of the PE file,
         // this could be done in better and more interesting ways, but this is the way my loader chooses to do this for now
-        let Some(alloc_size) = pe.section_headers().iter().map(|x| x.VirtualAddress + x.VirtualSize).max() else {
+        let Some(alloc_size) = pe
+            .section_headers()
+            .iter()
+            .map(|x| x.VirtualAddress + x.VirtualSize)
+            .max()
+        else {
             return Err(io::ErrorKind::InvalidData.into());
         };
 
@@ -148,7 +149,9 @@ pub unsafe fn inject(process: ProcessIds, path: &str) -> Result<(), io::Error> {
                 let padding = (entry.SizeOfRawData - entry.VirtualSize) as usize;
                 copy_end -= padding;
 
-                println!("[+] section {name} disk data larger than memory allocation! will ignore {padding} bytes");
+                println!(
+                    "[+] section {name} disk data larger than memory allocation! will ignore {padding} bytes"
+                );
             }
             let copy_slice = &dll_bytes[copy_start..=copy_end];
 
@@ -159,7 +162,11 @@ pub unsafe fn inject(process: ProcessIds, path: &str) -> Result<(), io::Error> {
             if entry.VirtualSize > entry.SizeOfRawData {
                 // If the allocation is larger than the copy from disk, there may be lingering memory which could lead
                 // to weirdness
-                if !process::remote_write(&process, remote_va, vec![0u8; remote_alloc_size].as_slice()) {
+                if !process::remote_write(
+                    &process,
+                    remote_va,
+                    vec![0u8; remote_alloc_size].as_slice(),
+                ) {
                     println!("[!] failed zero-ing {name} allocation...");
                     return Err(io::ErrorKind::PermissionDenied.into());
                 }
@@ -175,7 +182,12 @@ pub unsafe fn inject(process: ProcessIds, path: &str) -> Result<(), io::Error> {
             let protection_flags = get_page_protection_from_characteristics(characteristics);
             let protection_str = get_page_protection_string_from_characteristics(characteristics);
 
-            if !process::remote_protect(&process, remote_va, remote_alloc_size as SIZE_T, protection_flags) {
+            if !process::remote_protect(
+                &process,
+                remote_va,
+                remote_alloc_size as SIZE_T,
+                protection_flags,
+            ) {
                 println!("[^] failed changing protection flags for section...");
                 continue;
             }
@@ -189,8 +201,51 @@ pub unsafe fn inject(process: ProcessIds, path: &str) -> Result<(), io::Error> {
         let remote_entrypoint_addr: *mut c_void = addr.offset(entrypoint) as *mut c_void;
         let remote_entrypoint_addr =
             std::mem::transmute::<*mut c_void, LPTHREAD_START_ROUTINE>(remote_entrypoint_addr);
-        let _ = process::remote_thread(&process, remote_entrypoint_addr, std::ptr::null_mut::<c_void>());
+        let _ = process::remote_thread(
+            &process,
+            remote_entrypoint_addr,
+            std::ptr::null_mut::<c_void>(),
+        );
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use winapi::um::winnt::{
+        IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, PAGE_EXECUTE_READ, PAGE_NOACCESS,
+    };
+
+    use crate::util::injector::{
+        get_page_protection_from_characteristics, get_page_protection_string_from_characteristics,
+        get_rwe_from_characteristics,
+    };
+
+    const READABLE_EXECUTABLE: u32 = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE;
+
+    #[test]
+    fn rwe_from_characteristics() {
+        let (readable, writable, executable) = get_rwe_from_characteristics(READABLE_EXECUTABLE);
+
+        assert!(readable);
+        assert!(!writable);
+        assert!(executable);
+    }
+
+    #[test]
+    fn protection_from_characteristics() {
+        let page_protection = get_page_protection_from_characteristics(READABLE_EXECUTABLE);
+        let page_noaccess = get_page_protection_from_characteristics(0);
+
+        assert_eq!(page_protection, PAGE_EXECUTE_READ);
+        assert_eq!(page_noaccess, PAGE_NOACCESS);
+    }
+
+    #[test]
+    fn rwe_string_from_characteristics() {
+        let rwe = get_page_protection_string_from_characteristics(READABLE_EXECUTABLE);
+
+        assert_eq!(rwe, "rx");
+    }
 }
