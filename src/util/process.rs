@@ -9,15 +9,16 @@ use winapi::{
         processthreadsapi::{CreateRemoteThread, GetCurrentProcessId, OpenProcess},
         psapi::{EnumProcesses, GetModuleBaseNameA},
         winnt::{LPSTR, MEM_COMMIT, MEM_TOP_DOWN, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+        wow64apiset::IsWow64Process,
     },
 };
 
-/// Warning: Because of the way EnumProcesses works,
-/// it'll only catch a maximum of the first 1024 processes
+/// Warning: Because of the way EnumProcesses works, it'll only catch a maximum of the first 1024 processes
 /// running, in order, on the system.
 ///
-/// EnumProcesses will not tell you if you need more bytes than
-/// you initially provided. To really check, you'd need a loop of reallocating.
+/// `EnumProcesses` will not tell you if you need more bytes than you initially provided.
+/// To really check, you'd need a loop of reallocating.
+/// 
 /// Surprisingly, I've yet to see this being documented anywhere besides ReactOS.
 fn get_all_processes() -> Vec<u32> {
     let mut pids: Vec<DWORD> = vec![0; 1024];
@@ -74,10 +75,9 @@ fn get_process_name_by_handle(handle: &SafeHandle) -> Option<String> {
         return None;
     }
 
-    let test = std::str::from_utf8(&name_bytes[..ret])
+    std::str::from_utf8(&name_bytes[..ret])
         .map(|x| x.to_string())
-        .ok();
-    test
+        .ok()
 }
 
 fn find_process_pid_by_name(name: &str) -> Option<u32> {
@@ -108,13 +108,23 @@ fn find_process_pid_by_name(name: &str) -> Option<u32> {
 }
 
 #[derive(Debug)]
+/// Various representations of a Windows process identifier.
 pub enum ProcessIds<'a> {
+    /// When the PID is requested during an operation, it will be looked up in the list of active processes
+    /// by the name provided.
+    ///
+    /// The name search is case-insensitive.
     Name(&'a str),
+    /// The process ID will be taken as-is. No validation is done, this must be done by the user.
     Pid(u32),
+    /// Process ID retrieved using the `GetCurrentProcessId` function.
     Yourself,
 }
 
 impl<'a> ProcessIds<'a> {
+    /// Acquires concrete process ID for the specified process identifier.
+    ///
+    /// Only guaranteed to be valid at the time of the request.
     pub fn get_os_pid(&'a self) -> Option<u32> {
         match *self {
             ProcessIds::Pid(pid) => Some(pid),
@@ -128,12 +138,8 @@ impl std::cmp::PartialOrd<ProcessIds<'_>> for ProcessIds<'_> {
     fn partial_cmp(&self, other: &ProcessIds<'_>) -> Option<std::cmp::Ordering> {
         use std::cmp::Ordering;
 
-        let Some(pid) = self.get_os_pid() else {
-            return None;
-        };
-        let Some(other_pid) = other.get_os_pid() else {
-            return None;
-        };
+        let pid = self.get_os_pid()?;
+        let other_pid = other.get_os_pid()?;
 
         if pid == other_pid {
             return Some(Ordering::Equal);
@@ -151,10 +157,16 @@ impl std::cmp::PartialEq<ProcessIds<'_>> for ProcessIds<'_> {
     }
 }
 
+/// Tries to open handle by process ID with the permissions described by the desired access,
+/// for more information refer to the `OpenProcess` MSDN page.
+///
+/// # Arguments
+/// * `process` - The target process.
+/// * `desired_access` - The desired access, check the `OpenProcess` MSDN page for reference.
 pub fn request_handle(process: ProcessIds<'_>, desired_access: DWORD) -> Option<SafeHandle> {
     let _process = &process;
     let pid = process.get_os_pid()?;
-    let process = SafeHandle::from(unsafe { OpenProcess(desired_access, 0, pid).into() });
+    let process = SafeHandle::from(unsafe { OpenProcess(desired_access, 0, pid) });
     let error = unsafe { GetLastError() };
     if error != 0 {
         unsafe { SetLastError(0) };
@@ -167,6 +179,15 @@ pub fn request_handle(process: ProcessIds<'_>, desired_access: DWORD) -> Option<
     Some(process)
 }
 
+/// Allocates memory into remote process by handle. Handle must have necessary permissions
+/// for the operation to succeed. For further information refer to the `OpenProcess` and
+/// `VirtualAllocEx` pages on MSDN.
+///
+/// # Arguments
+///
+/// * `process` - Process safe handle.
+/// * `size` - Size of the allocation requested in the remote process.
+/// * `protect` - Base page protection for the remote requested pages.
 pub unsafe fn remote_allocate(
     process: &SafeHandle,
     size: SIZE_T,
@@ -197,6 +218,14 @@ pub unsafe fn remote_allocate(
     Some(ptr)
 }
 
+/// Will attempt to write memory into the remote process at the specified remote address, using the
+/// provided data and it's associated size.
+///
+/// # Arguments
+///
+/// * `process` - Process safe handle.
+/// * `address` - The remote target address. Must previously exist in remote process address space. Otherwise refer to [`remote_allocate`].
+/// * `buffer` - A slice of memory to be written at `address`.
 pub unsafe fn remote_write<T>(process: &SafeHandle, address: *mut T, buffer: &[u8]) -> bool {
     if process.is_bad() {
         return false;
@@ -226,6 +255,15 @@ pub unsafe fn remote_write<T>(process: &SafeHandle, address: *mut T, buffer: &[u
     true
 }
 
+/// Change page(s) protection at the specified address for the specified number of bytes. Should at
+/// minimum affect the page that contains `address`.
+///
+/// # Arguments
+///
+/// * `process` - Process safe handle.
+/// * `address` - The remote target address.
+/// * `size` - The number of bytes over which to affect page protection.
+/// * `protect_flags` - The protection flags. For more information, please refer to the `VirtualProtectEx` page on MSDN.
 pub unsafe fn remote_protect<T>(
     process: &SafeHandle,
     address: *mut T,
@@ -256,6 +294,14 @@ pub unsafe fn remote_protect<T>(
     true
 }
 
+/// Begin thread in remote process at the specified start address with
+/// the specified parameter, which must also be a remote address.
+///
+/// # Arguments
+///
+/// * `process` - Process safe handle.
+/// * `start_address` - The address of the thread start routine.
+/// * `parameter` - Optional remote address to a parameter for the thread routine.
 pub unsafe fn remote_thread<T>(
     process: &SafeHandle,
     start_address: LPTHREAD_START_ROUTINE,
@@ -284,6 +330,26 @@ pub unsafe fn remote_thread<T>(
     }
 
     Some(ret)
+}
+
+/// Check if the target process is running under Windows on Windows 64.
+///
+/// # Arguments
+///
+/// * `process` - Process safe handle.
+pub fn is_wow64(process: &SafeHandle) -> Option<bool> {
+    if process.is_bad() {
+        return None;
+    }
+
+    let mut is_wow64 = 0;
+    let ret = unsafe { IsWow64Process(process.get(), &mut is_wow64) };
+    if ret != 0 {
+        unsafe { SetLastError(0) };
+        return None;
+    }
+
+    Some(is_wow64 == 1)
 }
 
 #[cfg(test)]

@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-winapi = { version = "0.3.9", features = ["processthreadsapi", "handleapi", "errhandlingapi", "memoryapi", "psapi", "winerror"] }
+winapi = { version = "0.3.9", features = ["processthreadsapi", "handleapi", "errhandlingapi", "memoryapi", "psapi", "winerror", "wow64apiset"] }
 pelite = "0.10.0"

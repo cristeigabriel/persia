@@ -1,4 +1,5 @@
-use pelite::{pe::exports::GetProcAddress, pe64::*};
+// PE structures are picked based on compilation target.
+use pelite::{pe::exports::GetProcAddress, pe::*};
 use std::{
     fs,
     io::{self},
@@ -14,11 +15,23 @@ use winapi::{
             IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
             IMAGE_SUBSYSTEM_WINDOWS_GUI, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
             PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PROCESS_ALL_ACCESS,
+            PROCESS_QUERY_INFORMATION,
         },
     },
 };
 
+use crate::util::handle::SafeHandle;
+
 use super::{process, process::ProcessIds};
+
+fn check_same_architecture_as_host(target: &SafeHandle) -> Option<bool> {
+    let this = process::request_handle(ProcessIds::Yourself, PROCESS_QUERY_INFORMATION).unwrap();
+
+    let this_wow64 = process::is_wow64(&this)?;
+    let target_wow64 = process::is_wow64(target)?;
+
+    Some(this_wow64 == target_wow64)
+}
 
 fn validate_pe_and_get_entrypoint(pe: &PeFile<'_>) -> Result<isize, io::Error> {
     // Parse the according optional header
@@ -86,7 +99,7 @@ fn get_page_protection_string_from_characteristics(characteristics: u32) -> Stri
         protection_str += "x";
     }
 
-    return protection_str;
+    protection_str
 }
 
 pub unsafe fn inject(process: ProcessIds, path: &str) -> Result<(), io::Error> {
@@ -99,6 +112,19 @@ pub unsafe fn inject(process: ProcessIds, path: &str) -> Result<(), io::Error> {
         let error = unsafe { GetLastError() as i32 };
         return Err(io::Error::from_raw_os_error(error));
     };
+
+    // Make sure both processes match architecture
+    let Some(same_architecture) = check_same_architecture_as_host(&process) else {
+        println!("[!] unable to check host/target architecture...");
+        return Err(io::ErrorKind::PermissionDenied.into());
+    };
+
+    if !same_architecture {
+        println!(
+            "[!] unable to inject into process of different architecture... please use an appropriate build of the injector"
+        );
+        return Err(io::ErrorKind::Unsupported.into());
+    }
 
     // Parse PE
     let Ok(pe) = PeFile::from_bytes(dll_bytes) else {
@@ -132,7 +158,7 @@ pub unsafe fn inject(process: ProcessIds, path: &str) -> Result<(), io::Error> {
         let sections = pe.section_headers();
         for entry in sections {
             // Section name
-            let name = entry.name().ok().or_else(|| Some("[unnamed]")).unwrap();
+            let name = entry.name().ok().unwrap_or("[unnamed]");
 
             // TODO here: relocations!
             // TODO here: fix imports!
