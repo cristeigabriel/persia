@@ -6,7 +6,9 @@ use winapi::{
         errhandlingapi::{GetLastError, SetLastError},
         memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory},
         minwinbase::LPTHREAD_START_ROUTINE,
-        processthreadsapi::{CreateRemoteThread, GetCurrentProcessId, OpenProcess},
+        processthreadsapi::{
+            CreateRemoteThread, GetCurrentProcess, GetCurrentProcessId, OpenProcess,
+        },
         psapi::{EnumProcesses, GetModuleBaseNameA},
         winnt::{LPSTR, MEM_COMMIT, MEM_TOP_DOWN, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
         wow64apiset::IsWow64Process,
@@ -18,7 +20,7 @@ use winapi::{
 ///
 /// `EnumProcesses` will not tell you if you need more bytes than you initially provided.
 /// To really check, you'd need a loop of reallocating.
-/// 
+///
 /// Surprisingly, I've yet to see this being documented anywhere besides ReactOS.
 fn get_all_processes() -> Vec<u32> {
     let mut pids: Vec<DWORD> = vec![0; 1024];
@@ -155,6 +157,12 @@ impl std::cmp::PartialEq<ProcessIds<'_>> for ProcessIds<'_> {
     fn eq(&self, other: &ProcessIds<'_>) -> bool {
         self.get_os_pid() == other.get_os_pid()
     }
+}
+
+/// Obtains a process safe handle of the current process, granting you `PROCESS_ALL_ACCESS`
+/// access rights. For more information, please refer to the `GetCurrentProcess` MSDN page.
+pub fn current_process() -> SafeHandle {
+    SafeHandle::from(unsafe { GetCurrentProcess() })
 }
 
 /// Tries to open handle by process ID with the permissions described by the desired access,
@@ -344,7 +352,8 @@ pub fn is_wow64(process: &SafeHandle) -> Option<bool> {
 
     let mut is_wow64 = 0;
     let ret = unsafe { IsWow64Process(process.get(), &mut is_wow64) };
-    if ret != 0 {
+    let error = unsafe { GetLastError() };
+    if ret == 0 || error != 0 {
         unsafe { SetLastError(0) };
         return None;
     }

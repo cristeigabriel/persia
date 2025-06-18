@@ -3,18 +3,21 @@ use std::{env, io};
 use util::{injector, process};
 
 fn main() -> Result<(), io::Error> {
-    println!(".~^ _persia_ i^i");
-
     // Gather process execution name, process (if any), and dll path (if any)
     // If we fail, print usage string and error out
     let mut args = env::args();
     let name = args.next().unwrap();
+
+    fn print_usage(name: &String) {
+        println!("usage: {} <processs> <dll_path>\n\n", name);
+    }
+
     let Some(process) = args.next() else {
-        println!("usage: {} <processs> <dll_path>", name);
+        print_usage(&name);
         return Err(io::ErrorKind::InvalidInput.into());
     };
     let Some(dll_path) = args.next() else {
-        println!("usage: {} <processs> <dll_path>", name);
+        print_usage(&name);
         return Err(io::ErrorKind::InvalidInput.into());
     };
 
@@ -35,9 +38,11 @@ fn main() -> Result<(), io::Error> {
         }
     }) else {
         println!("[!] invalid process, not a valid pid or string!");
-        println!("usage: {} <processs> <dll_path>", name);
+        print_usage(&name);
         return Err(io::ErrorKind::InvalidInput.into());
     };
+
+    println!(".~^ _persia_ i^i");
 
     use injector::inject;
     use process::ProcessIds;

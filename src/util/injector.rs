@@ -15,7 +15,6 @@ use winapi::{
             IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
             IMAGE_SUBSYSTEM_WINDOWS_GUI, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
             PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PROCESS_ALL_ACCESS,
-            PROCESS_QUERY_INFORMATION,
         },
     },
 };
@@ -25,7 +24,7 @@ use crate::util::handle::SafeHandle;
 use super::{process, process::ProcessIds};
 
 fn check_same_architecture_as_host(target: &SafeHandle) -> Option<bool> {
-    let this = process::request_handle(ProcessIds::Yourself, PROCESS_QUERY_INFORMATION).unwrap();
+    let this = process::current_process();
 
     let this_wow64 = process::is_wow64(&this)?;
     let target_wow64 = process::is_wow64(target)?;
